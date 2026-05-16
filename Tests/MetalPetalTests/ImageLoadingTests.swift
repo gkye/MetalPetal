@@ -13,6 +13,44 @@ import VideoToolbox
 
 final class ImageLoadingTests: XCTestCase {
     
+    func testExplicitYCbCrConversion_rec709VideoRange8Bit() throws {
+        let pixelBuffer = try make8BitBiPlanarPixelBuffer(pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, y: 235, cb: 128, cr: 128)
+        let cgImage = try renderExplicitYCbCr(pixelBuffer, range: 0, matrix: 1, primaries: 0, transferFunction: 0, bitDepth: 8)
+        assertUniformPixel(in: cgImage, r: 255, g: 255, b: 255)
+    }
+    
+    func testExplicitYCbCrConversion_rec709FullRange8Bit() throws {
+        let pixelBuffer = try make8BitBiPlanarPixelBuffer(pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, y: 128, cb: 128, cr: 255)
+        let cgImage = try renderExplicitYCbCr(pixelBuffer, range: 1, matrix: 1, primaries: 0, transferFunction: 0, bitDepth: 8)
+        assertUniformPixel(in: cgImage, r: 255, g: 68, b: 128, tolerance: 2)
+    }
+    
+    func testExplicitYCbCrConversion_rec2020VideoRange10Bit() throws {
+        let pixelBuffer = try make10BitBiPlanarPixelBuffer(pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, y: 502, cb: 512, cr: 960)
+        let cgImage = try renderExplicitYCbCr(pixelBuffer, range: 0, matrix: 2, primaries: 1, transferFunction: 3, bitDepth: 10)
+        assertUniformPixel(in: cgImage, r: 255, g: 55, b: 128, tolerance: 2)
+    }
+    
+    func testExplicitYCbCrConversionRejectsUnsupportedConstantLuminance() throws {
+        let pixelBuffer = try make10BitBiPlanarPixelBuffer(pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, y: 502, cb: 512, cr: 512)
+        let conversion = MTIYCbCrPixelBufferConversion(
+            range: MTIYCbCrRange(rawValue: 0)!,
+            matrix: MTIYCbCrMatrix(rawValue: 3)!,
+            primaries: MTIColorPrimaries(rawValue: 1)!,
+            transferFunction: MTITransferFunction(rawValue: 3)!,
+            bitDepth: 10,
+            alphaMode: MTIYCbCrAlphaMode(rawValue: 0)!
+        )
+        let options = MTICVPixelBufferRenderingOptions(
+            renderingAPI: MTICVPixelBufferRenderingAPI(rawValue: 1)!,
+            sRGB: false,
+            explicitYCbCrConversion: conversion
+        )
+        let image = MTIImage(cvPixelBuffer: pixelBuffer, options: options, alphaType: .alphaIsOne)
+        let context = try makeContext()
+        XCTAssertThrowsError(try context.makeCGImage(from: image))
+    }
+    
     func testCVPixelBufferLoading_cvMetalTextureCache() throws {
         var buffer: CVPixelBuffer?
         let r = CVPixelBufferCreate(kCFAllocatorDefault, 2, 2, kCVPixelFormatType_32BGRA, [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary, &buffer)
@@ -110,6 +148,95 @@ final class ImageLoadingTests: XCTestCase {
             if coordinates.x == 1 && coordinates.y == 0 {
                 XCTAssert(pixel.r == 255 && pixel.g == 255 && pixel.b == 0 && pixel.a == 255)
             }
+        }
+    }
+    
+    private func renderExplicitYCbCr(_ pixelBuffer: CVPixelBuffer, range: Int, matrix: Int, primaries: Int, transferFunction: Int, bitDepth: Int) throws -> CGImage {
+        let conversion = MTIYCbCrPixelBufferConversion(
+            range: MTIYCbCrRange(rawValue: range)!,
+            matrix: MTIYCbCrMatrix(rawValue: matrix)!,
+            primaries: MTIColorPrimaries(rawValue: primaries)!,
+            transferFunction: MTITransferFunction(rawValue: transferFunction)!,
+            bitDepth: UInt(bitDepth),
+            alphaMode: MTIYCbCrAlphaMode(rawValue: 0)!
+        )
+        let options = MTICVPixelBufferRenderingOptions(
+            renderingAPI: MTICVPixelBufferRenderingAPI(rawValue: 1)!,
+            sRGB: false,
+            explicitYCbCrConversion: conversion
+        )
+        let image = MTIImage(cvPixelBuffer: pixelBuffer, options: options, alphaType: .alphaIsOne)
+        let context = try makeContext()
+        return try context.makeCGImage(from: image)
+    }
+    
+    private func make8BitBiPlanarPixelBuffer(pixelFormat: OSType, y: UInt8, cb: UInt8, cr: UInt8) throws -> CVPixelBuffer {
+        var buffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            2,
+            2,
+            pixelFormat,
+            [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary,
+            &buffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer = buffer else {
+            throw NSError(domain: "MetalPetalTests", code: Int(status), userInfo: nil)
+        }
+        
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        
+        let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)!.assumingMemoryBound(to: UInt8.self)
+        let yBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        for row in 0..<2 {
+            yBase.advanced(by: row * yBytesPerRow).assign(repeating: y, count: 2)
+        }
+        
+        let cbcrBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)!.assumingMemoryBound(to: UInt8.self)
+        cbcrBase[0] = cb
+        cbcrBase[1] = cr
+        
+        return pixelBuffer
+    }
+    
+    private func make10BitBiPlanarPixelBuffer(pixelFormat: OSType, y: UInt16, cb: UInt16, cr: UInt16) throws -> CVPixelBuffer {
+        var buffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            2,
+            2,
+            pixelFormat,
+            [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary,
+            &buffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer = buffer else {
+            throw NSError(domain: "MetalPetalTests", code: Int(status), userInfo: nil)
+        }
+        
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        
+        let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)!.assumingMemoryBound(to: UInt16.self)
+        let yElementsPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0) / MemoryLayout<UInt16>.stride
+        for row in 0..<2 {
+            yBase[row * yElementsPerRow] = y << 6
+            yBase[row * yElementsPerRow + 1] = y << 6
+        }
+        
+        let cbcrBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)!.assumingMemoryBound(to: UInt16.self)
+        cbcrBase[0] = cb << 6
+        cbcrBase[1] = cr << 6
+        
+        return pixelBuffer
+    }
+    
+    private func assertUniformPixel(in cgImage: CGImage, r: UInt8, g: UInt8, b: UInt8, tolerance: UInt8 = 1) {
+        PixelEnumerator.enumeratePixels(in: cgImage) { pixel, _ in
+            XCTAssertLessThanOrEqual(abs(Int(pixel.r) - Int(r)), Int(tolerance))
+            XCTAssertLessThanOrEqual(abs(Int(pixel.g) - Int(g)), Int(tolerance))
+            XCTAssertLessThanOrEqual(abs(Int(pixel.b) - Int(b)), Int(tolerance))
+            XCTAssertEqual(pixel.a, 255)
         }
     }
 }
