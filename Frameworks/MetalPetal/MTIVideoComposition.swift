@@ -157,9 +157,19 @@ public class MTIAsyncVideoCompositionRequestHandler {
                     
                     if (request as? MTITrackedVideoCompositionRequest)?.isCancelled == true { return }
                     
-                    try self.context.render(image, to: pixelBuffer)
-                    
-                    request.finish(.success(pixelBuffer))
+                    // Finish the request only after the GPU has actually written the
+                    // frame. `render(_:to:)` returns once the command buffer is
+                    // scheduled, not completed; finishing there lets AVFoundation hand
+                    // a still-in-flight pixel buffer to a consumer that reads the
+                    // IOSurface directly (e.g. a hardware encoder fed native 4:2:0
+                    // buffers), which shows up as partially written frames.
+                    _ = try self.context.startTask(toRender: image, to: pixelBuffer, sRGB: false) { task in
+                        if let error = task.error {
+                            request.finish(.failure(error))
+                        } else {
+                            request.finish(.success(pixelBuffer))
+                        }
+                    }
                 } catch {
                     request.finish(.failure(error))
                 }
