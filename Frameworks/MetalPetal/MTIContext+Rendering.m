@@ -244,7 +244,17 @@ static const void * const MTICIImageMTIImageAssociationKey = &MTICIImageMTIImage
     
     id<MTLTexture> metalTexture = renderTexture.texture;
     
-    if (resolution.texture.pixelFormat == targetPixelFormat &&
+    // A blit between two combined YCbCr 4:2:0 textures copies the luma plane
+    // but only part of the chroma plane (the right half comes out as Cb = Cr
+    // = 0, bright green). This happens whenever a YCbCr-backed source image
+    // is passed through unchanged into a YCbCr output buffer of the same
+    // size. Always go through a render pass for YCbCr targets.
+    BOOL targetIsYCbCr = (targetPixelFormat == MTIPixelFormatYCBCR8_420_2P ||
+                          targetPixelFormat == MTIPixelFormatYCBCR8_420_2P_sRGB ||
+                          targetPixelFormat == MTIPixelFormatYCBCR10_420_2P ||
+                          targetPixelFormat == MTIPixelFormatYCBCR10_420_2P_sRGB);
+    if (!targetIsYCbCr &&
+        resolution.texture.pixelFormat == targetPixelFormat &&
         (image.alphaType == destinationAlphaType || image.alphaType == MTIAlphaTypeAlphaIsOne) &&
         resolution.texture.width == frameWidth &&
         resolution.texture.height == frameHeight)
