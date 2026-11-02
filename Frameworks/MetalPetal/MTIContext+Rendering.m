@@ -27,6 +27,8 @@
 #import "MTIRenderTask.h"
 #import "MTIImageRenderingContext+Internal.h"
 #import "MTIPixelFormat.h"
+#import "MTIImage+Promise.h"
+#import "MTIRenderPipelineKernel+Internal.h"
 
 @implementation MTIContext (Rendering)
 
@@ -152,17 +154,6 @@ static const void * const MTICIImageMTIImageAssociationKey = &MTICIImageMTIImage
     MTIImageRenderingContext *renderingContext = [[MTIImageRenderingContext alloc] initWithContext:self];
     
     NSError *error = nil;
-    id<MTIImagePromiseResolution> resolution = [renderingContext resolutionForImage:image error:&error];
-    @MTI_DEFER {
-        [resolution markAsConsumedBy:self];
-    };
-    if (error) {
-        if (inOutError) {
-            *inOutError = error;
-        }
-        return nil;
-    }
-    
     OSType pixelFormatType = CVPixelBufferGetPixelFormatType(pixelBuffer);
     MTLPixelFormat targetPixelFormat;
     switch (pixelFormatType) {
@@ -243,6 +234,41 @@ static const void * const MTICIImageMTIImageAssociationKey = &MTICIImageMTIImage
     }
     
     id<MTLTexture> metalTexture = renderTexture.texture;
+    
+    // A render-pipeline image of the frame's size can draw straight into the pixel buffer's texture instead of a pooled one.
+    MTIImage *imageToRender = image;
+    if (self.isDirectPixelBufferDeliveryEnabled &&
+        (image.alphaType == destinationAlphaType || image.alphaType == MTIAlphaTypeAlphaIsOne) &&
+        [image.promise isKindOfClass:MTIImageRenderingPromise.class]) {
+        MTIImageRenderingPromise *delivering = [(MTIImageRenderingPromise *)image.promise promiseByDeliveringToTexture:metalTexture context:self];
+        if (delivering) {
+            imageToRender = [[MTIImage alloc] initWithPromise:delivering samplerDescriptor:image.samplerDescriptor cachePolicy:MTIImageCachePolicyTransient];
+        }
+    }
+    
+    id<MTIImagePromiseResolution> resolution = [renderingContext resolutionForImage:imageToRender error:&error];
+    @MTI_DEFER {
+        [resolution markAsConsumedBy:self];
+    };
+    if (error) {
+        if (inOutError) {
+            *inOutError = error;
+        }
+        return nil;
+    }
+    
+    if (resolution.texture == metalTexture) {
+        // Delivered by its own pass.
+        MTIRenderTask *task = [[MTIRenderTask alloc] initWithCommandBuffer:renderingContext.commandBuffer];
+        if (completion) {
+            [renderingContext.commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                completion(task);
+            }];
+        }
+        [renderingContext.commandBuffer commit];
+        [renderingContext.commandBuffer waitUntilScheduled];
+        return task;
+    }
     
     // A blit between two combined YCbCr 4:2:0 textures copies the luma plane
     // but only part of the chroma plane (the right half comes out as Cb = Cr

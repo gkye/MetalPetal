@@ -73,6 +73,7 @@ static NSBundle * MTIDefaultBuiltinLibraryBundle(void) {
         _workingPixelFormat = MTLPixelFormatBGRA8Unorm;
         _enablesRenderGraphOptimization = NO;
         _enablesYCbCrPixelFormatSupport = YES;
+        _enablesDirectPixelBufferDelivery = NO;
         _automaticallyReclaimsResources = YES;
         _label = MTIContextDefaultLabel;
         
@@ -97,6 +98,7 @@ static NSBundle * MTIDefaultBuiltinLibraryBundle(void) {
     options.workingPixelFormat = _workingPixelFormat;
     options.enablesRenderGraphOptimization = _enablesRenderGraphOptimization;
     options.enablesYCbCrPixelFormatSupport = _enablesYCbCrPixelFormatSupport;
+    options.enablesDirectPixelBufferDelivery = _enablesDirectPixelBufferDelivery;
     options.automaticallyReclaimsResources = _automaticallyReclaimsResources;
     options.label = _label;
     options.defaultLibraryURL = _defaultLibraryURL;
@@ -262,6 +264,7 @@ static void MTIContextEnumerateAllInstances(void (^enumerator)(MTIContext *conte
         _isYCbCrPixelFormatSupported = options.enablesYCbCrPixelFormatSupport && MTIDeviceSupportsYCBCRPixelFormat(device);
         _isMemorylessTextureSupported = [MTIContext deviceSupportsMemorylessTexture:device];
         _isProgrammableBlendingSupported = [MTIContext deviceSupportsProgrammableBlending:device];
+        _isDirectPixelBufferDeliveryEnabled = options.enablesDirectPixelBufferDelivery && _isMemorylessTextureSupported && _isProgrammableBlendingSupported && _defaultLibrarySupportsProgrammableBlending;
         
         _textureLoader = [(options.textureLoaderClass ?: MTIDefaultTextureLoader.class) newTextureLoaderWithDevice:device];
         NSAssert(_textureLoader != nil, @"Cannot create texture loader.");

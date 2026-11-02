@@ -41,6 +41,9 @@ __attribute__((objc_subclassing_restricted))
 /// Whether to enable native support for YCbCr textures. The default value for this property is YES. YCbCr textures can be used when this property is set to YES, and the device supports this feature.
 @property (nonatomic) BOOL enablesYCbCrPixelFormatSupport;
 
+/// Whether a render-pipeline image rendered to a CVPixelBuffer may draw its last pass straight into the buffer's texture, through a memoryless tile attachment, instead of into a pooled texture that a second pass copies. Needs programmable blending and memoryless textures. The default value for this property is NO.
+@property (nonatomic) BOOL enablesDirectPixelBufferDelivery;
+
 /// A string to help identify this object.
 @property (nonatomic, copy) NSString *label;
 
@@ -83,6 +86,9 @@ __attribute__((objc_subclassing_restricted))
 
 /// Whether the device supports YCbCr pixel formats.
 @property (nonatomic, readonly) BOOL isYCbCrPixelFormatSupported;
+
+/// Whether render-pipeline images deliver straight into CVPixelBuffer textures. See `MTIContextOptions.enablesDirectPixelBufferDelivery`.
+@property (nonatomic, readonly) BOOL isDirectPixelBufferDeliveryEnabled;
 
 /// Whether the device supports memoryless texture.
 @property (nonatomic, readonly) BOOL isMemorylessTextureSupported;

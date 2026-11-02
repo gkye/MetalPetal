@@ -7,6 +7,8 @@
 //
 
 #import "MTIRenderPipelineKernel.h"
+#import "MTIRenderPipelineKernel+Internal.h"
+#import "MTIFilter.h"
 #import "MTIContext.h"
 #import "MTIFunctionDescriptor.h"
 #import "MTIImage.h"
@@ -138,7 +140,7 @@ NSUInteger const MTIRenderPipelineMaximumColorAttachmentCount = 8;
 }
 
 - (id)newKernelStateWithContext:(MTIContext *)context configuration:(MTIRenderPipelineKernelConfiguration *)configuration error:(NSError * __autoreleasing *)inOutError {
-    NSParameterAssert(configuration.colorAttachmentCount == self.colorAttachmentCount);
+    NSParameterAssert(configuration.colorAttachmentCount >= self.colorAttachmentCount);
     
     MTLRenderPipelineDescriptor *renderPipelineDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
     renderPipelineDescriptor.vertexDescriptor = self.vertexDescriptor;
@@ -163,10 +165,14 @@ NSUInteger const MTIRenderPipelineMaximumColorAttachmentCount = 8;
     renderPipelineDescriptor.vertexFunction = vertextFunction;
     renderPipelineDescriptor.fragmentFunction = fragmentFunction;
     
-    for (NSUInteger index = 0; index < self.colorAttachmentCount; index += 1) {
+    for (NSUInteger index = 0; index < configuration.colorAttachmentCount; index += 1) {
         MTLRenderPipelineColorAttachmentDescriptor *colorAttachmentDescriptor = [[MTLRenderPipelineColorAttachmentDescriptor alloc] init];
         colorAttachmentDescriptor.pixelFormat = configuration.colorAttachmentPixelFormats[index];
         colorAttachmentDescriptor.blendingEnabled = NO;
+        // A delivery pass carries one more attachment than its kernels write; it keeps its tile value through their draws.
+        if (index >= self.colorAttachmentCount) {
+            colorAttachmentDescriptor.writeMask = MTLColorWriteMaskNone;
+        }
         renderPipelineDescriptor.colorAttachments[index] = colorAttachmentDescriptor;
     }
     renderPipelineDescriptor.depthAttachmentPixelFormat = configuration.depthAttachmentPixelFormat;
@@ -183,12 +189,7 @@ NSUInteger const MTIRenderPipelineMaximumColorAttachmentCount = 8;
 
 @end
 
-__attribute__((objc_subclassing_restricted))
-@interface MTIImageRenderingRecipe : NSObject
-
-@property (nonatomic, copy, readonly) NSArray<MTIRenderCommand *> *renderCommands;
-
-@property (nonatomic,copy,readonly) NSArray<MTIRenderPassOutputDescriptor *> *outputDescriptors;
+@interface MTIImageRenderingRecipe ()
 
 @property (nonatomic, strong, readonly) MTIWeakToStrongObjectsMapTable *resolutionCache;
 @property (nonatomic, strong, readonly) id<NSLocking> resolutionCacheLock;
@@ -197,11 +198,22 @@ __attribute__((objc_subclassing_restricted))
 
 @property (nonatomic, copy, readonly) NSArray<MTIImage *> *dependencies;
 
-@property (nonatomic, readonly) NSUInteger rasterSampleCount;
-
 @end
 
 @implementation MTIImageRenderingRecipe
+
++ (MTIRenderPipelineKernel *)deliveryKernel {
+    static MTIRenderPipelineKernel *kernel;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        kernel = [[MTIRenderPipelineKernel alloc] initWithVertexFunctionDescriptor:[[MTIFunctionDescriptor alloc] initWithName:MTIFilterPassthroughVertexFunctionName]
+                                                        fragmentFunctionDescriptor:[[MTIFunctionDescriptor alloc] initWithName:@"deliverCurrentColor"]
+                                                                  vertexDescriptor:nil
+                                                              colorAttachmentCount:2
+                                                             alphaTypeHandlingRule:MTIAlphaTypeHandlingRule.passthroughAlphaTypeHandlingRule];
+    });
+    return kernel;
+}
 
 - (NSArray<MTIImagePromiseRenderTarget *> *)resolveWithContext:(MTIImageRenderingContext *)renderingContext resolver:(id<MTIImagePromise>)promise error:(NSError * __autoreleasing *)inOutError {
     NSError *error = nil;
@@ -209,13 +221,42 @@ __attribute__((objc_subclassing_restricted))
     MTLRenderPassDescriptor *renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
     
     NSUInteger outputCount = self.outputDescriptors.count;
-    MTLPixelFormat pixelFormats[outputCount];
+    // A delivery pass has the delivery texture as its second attachment.
+    NSUInteger attachmentCount = _deliveryTexture ? 2 : outputCount;
+    MTLPixelFormat pixelFormats[attachmentCount];
     MTIImagePromiseRenderTarget *renderTargets[outputCount];
     for (NSUInteger index = 0; index < outputCount; index += 1) {
         MTIRenderPassOutputDescriptor *outputDescriptor = self.outputDescriptors[index];
         
         MTLPixelFormat pixelFormat = (outputDescriptor.pixelFormat == MTIPixelFormatUnspecified) ? renderingContext.context.workingPixelFormat : outputDescriptor.pixelFormat;
         pixelFormats[index] = pixelFormat;
+        
+        if (_deliveryTexture) {
+            // The draws land in tile memory only; the delivery draw copies the tile into the delivery texture. Memoryless textures cannot come from the pool's heaps.
+            id<MTLTexture> tileTexture = nil;
+            if (@available(macCatalyst 14.0, macOS 11.0, *)) {
+                MTLTextureDescriptor *tileDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat width:outputDescriptor.dimensions.width height:outputDescriptor.dimensions.height mipmapped:NO];
+                tileDescriptor.usage = MTLTextureUsageRenderTarget;
+                tileDescriptor.storageMode = MTLStorageModeMemoryless;
+                tileTexture = [renderingContext.context.device newTextureWithDescriptor:tileDescriptor];
+            }
+            if (!tileTexture) {
+                if (inOutError) {
+                    *inOutError = MTIErrorCreate(MTIErrorFailedToCreateTexture, nil);
+                }
+                return nil;
+            }
+            renderPassDescriptor.colorAttachments[0].texture = tileTexture;
+            renderPassDescriptor.colorAttachments[0].clearColor = outputDescriptor.clearColor;
+            renderPassDescriptor.colorAttachments[0].loadAction = outputDescriptor.loadAction == MTLLoadActionLoad ? MTLLoadActionClear : outputDescriptor.loadAction;
+            renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+            renderPassDescriptor.colorAttachments[1].texture = _deliveryTexture;
+            renderPassDescriptor.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+            renderPassDescriptor.colorAttachments[1].storeAction = MTLStoreActionStore;
+            pixelFormats[1] = _deliveryTexture.pixelFormat;
+            renderTargets[0] = [renderingContext.context newRenderTargetWithTexture:_deliveryTexture];
+            break;
+        }
         
         MTITextureDescriptor *textureDescriptor = [MTITextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat width:outputDescriptor.dimensions.width height:outputDescriptor.dimensions.height mipmapped:NO usage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead resourceOptions:MTLResourceStorageModePrivate];
         MTIImagePromiseRenderTarget *renderTarget = [renderingContext.context newRenderTargetWithReusableTextureDescriptor:textureDescriptor error:&error];
@@ -293,7 +334,7 @@ __attribute__((objc_subclassing_restricted))
     }
     
     for (MTIRenderCommand *command in self.renderCommands) {
-        MTIRenderPipeline *renderPipeline = [renderingContext.context kernelStateForKernel:command.kernel configuration:[MTIRenderPipelineKernelConfiguration configurationWithColorAttachmentPixelFormats:pixelFormats count:outputCount rasterSampleCount:_rasterSampleCount] error:&error];
+        MTIRenderPipeline *renderPipeline = [renderingContext.context kernelStateForKernel:command.kernel configuration:[MTIRenderPipelineKernelConfiguration configurationWithColorAttachmentPixelFormats:pixelFormats count:attachmentCount rasterSampleCount:_rasterSampleCount] error:&error];
         
         if (error) {
             if (inOutError) {
@@ -380,6 +421,19 @@ __attribute__((objc_subclassing_restricted))
         [command.geometry encodeDrawCallWithCommandEncoder:commandEncoder context:renderPipeline];
     }
     
+    if (_deliveryTexture) {
+        MTIRenderPipeline *deliveryPipeline = [renderingContext.context kernelStateForKernel:MTIImageRenderingRecipe.deliveryKernel configuration:[MTIRenderPipelineKernelConfiguration configurationWithColorAttachmentPixelFormats:pixelFormats count:attachmentCount rasterSampleCount:1] error:&error];
+        if (error) {
+            if (inOutError) {
+                *inOutError = error;
+            }
+            [commandEncoder endEncoding];
+            return nil;
+        }
+        [commandEncoder setRenderPipelineState:deliveryPipeline.state];
+        [MTIVertices.fullViewportSquareVertices encodeDrawCallWithCommandEncoder:commandEncoder context:deliveryPipeline];
+    }
+    
     [commandEncoder endEncoding];
     
     return [NSArray arrayWithObjects:renderTargets count:self.outputDescriptors.count];
@@ -392,13 +446,22 @@ __attribute__((objc_subclassing_restricted))
 - (instancetype)initWithRenderCommands:(NSArray<MTIRenderCommand *> *)renderCommands
                      rasterSampleCount:(NSUInteger)rasterSampleCount
                      outputDescriptors:(NSArray<MTIRenderPassOutputDescriptor *> *)outputDescriptors {
+    return [self initWithRenderCommands:renderCommands rasterSampleCount:rasterSampleCount outputDescriptors:outputDescriptors deliveryTexture:nil];
+}
+
+- (instancetype)initWithRenderCommands:(NSArray<MTIRenderCommand *> *)renderCommands
+                     rasterSampleCount:(NSUInteger)rasterSampleCount
+                     outputDescriptors:(NSArray<MTIRenderPassOutputDescriptor *> *)outputDescriptors
+                       deliveryTexture:(id<MTLTexture>)deliveryTexture {
     if (self = [super init]) {
         NSParameterAssert(renderCommands.count > 0);
         NSParameterAssert(rasterSampleCount >= 1);
         NSParameterAssert(outputDescriptors.count > 0);
+        NSParameterAssert(deliveryTexture == nil || (outputDescriptors.count == 1 && rasterSampleCount == 1));
         _renderCommands = [renderCommands copy];
         _outputDescriptors = [outputDescriptors copy];
         _rasterSampleCount = rasterSampleCount;
+        _deliveryTexture = deliveryTexture;
         if (renderCommands.count == 0) {
             _dependencies = @[];
         } else if (renderCommands.count == 1) {
@@ -421,16 +484,19 @@ __attribute__((objc_subclassing_restricted))
 
 @end
 
-__attribute__((objc_subclassing_restricted))
-@interface MTIImageRenderingPromise: NSObject <MTIImagePromise>
-
-@property (nonatomic, strong, readonly) MTIImageRenderingRecipe *recipe;
-
-@property (nonatomic, readonly) NSUInteger outputIndex;
-
-@end
-
 @implementation MTIImageRenderingPromise
+
+- (instancetype)promiseByDeliveringToTexture:(id<MTLTexture>)texture context:(MTIContext *)context {
+    MTIImageRenderingRecipe *recipe = self.recipe;
+    MTITextureDimensions dimensions = recipe.outputDescriptors.firstObject.dimensions;
+    if (recipe.outputDescriptors.count != 1 || recipe.rasterSampleCount != 1 || recipe.deliveryTexture != nil ||
+        dimensions.width != texture.width || dimensions.height != texture.height || dimensions.depth != 1 ||
+        !context.isMemorylessTextureSupported || !context.isProgrammableBlendingSupported || !context.defaultLibrarySupportsProgrammableBlending) {
+        return nil;
+    }
+    MTIImageRenderingRecipe *delivering = [[MTIImageRenderingRecipe alloc] initWithRenderCommands:recipe.renderCommands rasterSampleCount:1 outputDescriptors:recipe.outputDescriptors deliveryTexture:texture];
+    return [[MTIImageRenderingPromise alloc] initWithImageRenderingRecipe:delivering outputIndex:0];
+}
 
 - (NSArray<MTIImage *> *)dependencies {
     return self.recipe.dependencies;
@@ -491,7 +557,7 @@ __attribute__((objc_subclassing_restricted))
         MTIRenderCommand *newCommand = [[MTIRenderCommand alloc] initWithKernel:command.kernel geometry:command.geometry images:deps parameters:command.parameters];
         [newCommands addObject:newCommand];
     }
-    return [[MTIImageRenderingPromise alloc] initWithImageRenderingRecipe:[[MTIImageRenderingRecipe alloc] initWithRenderCommands:newCommands rasterSampleCount:_recipe.rasterSampleCount outputDescriptors:_recipe.outputDescriptors] outputIndex:_outputIndex];
+    return [[MTIImageRenderingPromise alloc] initWithImageRenderingRecipe:[[MTIImageRenderingRecipe alloc] initWithRenderCommands:newCommands rasterSampleCount:_recipe.rasterSampleCount outputDescriptors:_recipe.outputDescriptors deliveryTexture:_recipe.deliveryTexture] outputIndex:_outputIndex];
 }
 
 - (MTIImagePromiseDebugInfo *)debugInfo {

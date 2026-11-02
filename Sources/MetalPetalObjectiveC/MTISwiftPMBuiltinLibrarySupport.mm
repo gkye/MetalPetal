@@ -5032,6 +5032,19 @@ namespace metalpetal {
         return outVertex;
     }
 
+#if __HAVE_COLOR_ARGUMENTS__ && !TARGET_OS_SIMULATOR
+    struct DeliveredColor {
+        float4 color [[color(1)]];
+    };
+
+    // The pass's tile value copied into a second attachment, so a pass can end in a caller's texture.
+    fragment DeliveredColor deliverCurrentColor(float4 currentColor [[color(0)]]) {
+        DeliveredColor delivered;
+        delivered.color = currentColor;
+        return delivered;
+    }
+#endif
+
     fragment float4 passthrough(
         VertexOut vertexIn [[ stage_in ]],
         texture2d<float, access::sample> colorTexture [[ texture(0) ]],
