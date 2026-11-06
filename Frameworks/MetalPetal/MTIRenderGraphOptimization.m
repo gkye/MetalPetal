@@ -51,14 +51,16 @@
     return node;
 }
 
-+ (BOOL)performOptimizationOnNode:(MTIRenderGraphNode *)node promiseTable:(NSMapTable<id<MTIImagePromise>, id<MTIImagePromise>> *)promiseTable {
-    if (node.image.cachePolicy != MTIImageCachePolicyTransient) {
++ (BOOL)performOptimizationOnNode:(MTIRenderGraphNode *)node promiseTable:(NSMapTable<id<MTIImagePromise>, id<MTIImagePromise>> *)promiseTable visited:(NSHashTable<MTIRenderGraphNode *> *)visited {
+    // A node shared by several consumers is optimized once; walking it again per path is exponential in the shared depth.
+    if (node.image.cachePolicy != MTIImageCachePolicyTransient || [visited containsObject:node]) {
         return NO;
     }
-    
+    [visited addObject:node];
+
     BOOL optimized = NO;
     for (MTIRenderGraphNode *inputNode in node.inputs) {
-        if ([self performOptimizationOnNode:inputNode promiseTable:promiseTable]) {
+        if ([self performOptimizationOnNode:inputNode promiseTable:promiseTable visited:visited]) {
             optimized = YES;
         }
     }
@@ -84,12 +86,12 @@
         return node.image;
     }
     
-    NSMutableArray<MTIImage *> *dependencies = [NSMutableArray array];
-    for (MTIRenderGraphNode *inputNode in node.inputs) {
-        [dependencies addObject:[self generateOptimizedImageForNode:inputNode promiseTable:promiseTable]];
-    }
     id<MTIImagePromise> promise = [promiseTable objectForKey:node.image.promise];
     if (!promise) {
+        NSMutableArray<MTIImage *> *dependencies = [NSMutableArray array];
+        for (MTIRenderGraphNode *inputNode in node.inputs) {
+            [dependencies addObject:[self generateOptimizedImageForNode:inputNode promiseTable:promiseTable]];
+        }
         promise = [node.image.promise promiseByUpdatingDependencies:dependencies];
         [promiseTable setObject:promise forKey:node.image.promise];
     }
@@ -112,7 +114,7 @@
     
     //Optimize render graph
     [table removeAllObjects];
-    BOOL optimized = [self performOptimizationOnNode:rootNode promiseTable:table];
+    BOOL optimized = [self performOptimizationOnNode:rootNode promiseTable:table visited:[NSHashTable hashTableWithOptions:NSPointerFunctionsStrongMemory|NSPointerFunctionsObjectPointerPersonality]];
     if (optimized) {
         //Create merged promise
         [table removeAllObjects];

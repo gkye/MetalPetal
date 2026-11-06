@@ -73,6 +73,37 @@ final class RenderTests: XCTestCase {
         }
     }
     
+    func testRenderGraphOptimizationVisitsSharedImagesOnce() throws {
+        // Each level reads the previous image twice, so walking every path would visit 2^30 nodes.
+        var image = MTIImage(color: MTIColor(red: 0.6, green: 0.3, blue: 0.8, alpha: 1), sRGB: false, size: CGSize(width: 2, height: 2))
+        for _ in 0..<30 {
+            for saturation in [Float(0.98), 1.01] {
+                let filter = MTISaturationFilter()
+                filter.saturation = saturation
+                filter.inputImage = image
+                image = filter.outputImage!
+            }
+            let blend = MTIBlendFilter(blendMode: .normal)
+            blend.inputImage = image
+            blend.inputBackgroundImage = image
+            image = blend.outputImage!
+        }
+        // Float intermediates, so the merged matrices and the unmerged passes round alike.
+        let options = MTIContextOptions()
+        options.workingPixelFormat = .rgba32Float
+        let plain = try makeContext(options: options).makeCGImage(from: image)
+        options.enablesRenderGraphOptimization = true
+        let optimized = try makeContext(options: options).makeCGImage(from: image)
+        var expected: [PixelEnumerator.Pixel] = []
+        PixelEnumerator.enumeratePixels(in: plain) { pixel, _ in expected.append(pixel) }
+        var index = 0
+        PixelEnumerator.enumeratePixels(in: optimized) { pixel, _ in
+            let other = expected[index]
+            index += 1
+            XCTAssert(abs(Int(pixel.r) - Int(other.r)) <= 1 && abs(Int(pixel.g) - Int(other.g)) <= 1 && abs(Int(pixel.b) - Int(other.b)) <= 1, "\(pixel) vs \(other)")
+        }
+    }
+
     func testIntermediateTextureGeneration() throws {
         let image = MTIImage.black
         let saturationFilter = MTISaturationFilter()
